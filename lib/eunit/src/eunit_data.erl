@@ -45,6 +45,7 @@
 
 -export([iter_init/3, iter_next/1, iter_prev/1, iter_id/1,
 	 enter_context/3, get_module_tests/2]).
+-export([parse_command_line/2]). % for unit testing
 
 -define(TICKS_PER_SECOND, 1000).
 
@@ -193,11 +194,78 @@ next(Tests, Options) ->
 	    none
     end.
 
-%% Converts a string into list of strings via argparse, or passes lists of strings unchanged.
+cmd_parse_read_unquoted([], Acc) ->
+    {lists:reverse(Acc), []};
+cmd_parse_read_unquoted([C | Cs], Acc) ->
+    case is_ws(C) of
+        true -> {lists:reverse(Acc), [C | Cs]};
+        false -> cmd_parse_read_unquoted(Cs, [C | Acc])
+    end.
+
+%% Balanced: "value with spaces" -> Token = "value with spaces" without quotes.
+%% Unbalanced: "value with spaces   (no closing) -> Token starts with the quote.
+cmd_parse_read_quoted(_Quote, [], Acc) ->
+    %% No closing quote: return token with dangling opening quote, as-is
+    %% (include the opening quote, keep content unchanged).
+    {[$" | lists:reverse(Acc)], []};
+cmd_parse_read_quoted(Quote, [Quote | Rest], Acc) ->
+    {lists:reverse(Acc), Rest};
+cmd_parse_read_quoted(Quote, [$\\, C | Rest], Acc) ->
+    %% Backslash escapes the next character inside quotes
+    cmd_parse_read_quoted(Quote, Rest, [C | Acc]);
+cmd_parse_read_quoted(Quote, [C | Rest], Acc) ->
+    cmd_parse_read_quoted(Quote, Rest, [C | Acc]).
+
+cmd_parse_is_ws($\s) -> true;   %% space
+cmd_parse_is_ws($\t) -> true;   %% tab
+cmd_parse_is_ws($\n) -> true;   %% newline
+cmd_parse_is_ws($\r) -> true;   %% carriage return
+cmd_parse_is_ws(_) -> false.
+
+%% Consumes leading whitespaces without adding them to output
+cmd_parse_skip_ws([C | Cs]) ->
+    case cmd_parse_is_ws(C) of
+        true -> cmd_parse_skip_ws(Cs);
+        false -> C
+    end;
+cmd_parse_skip_ws(L) -> L.
+
+%% Parses an old style command line (a single string) into a list of strings.
+%% - Splits on whitespace.
+%% - If the next non-whitespace character is ' or ", consumes until the matching
+%%   closing quote; the quotes are removed for balanced quotes.
+%% - Inside quotes, backslash escapes the following character.
+%% - If the closing quote is missing, returns the parameter as-is with a dangling quote
+parse_command_line(Str, Acc) when is_list(Str) ->
+    case cmd_parse_skip_ws(Str) of
+        [] ->
+            lists:reverse(Acc);
+        [$" | Rest] ->
+            {Token, Rest1} = cmd_parse_read_quoted($", Rest, []),
+            parse_command_line(Rest1, [Token | Acc]);
+        [$' | Rest] ->
+            {Token, Rest1} = cmd_parse_read_quoted($', Rest, []),
+            parse_command_line(Rest1, [Token | Acc]);
+        Rest ->
+            {Token, Rest1} = cmd_parse_read_unquoted(Rest, []),
+            parse_command_line(Rest1, [Token | Acc])
+    end.
+
+%% Adapter for a string command line passed to old deprecated option
 parse_peer_args([]) -> [];
-parse_peer_args(Args = [C | _]) when is_integer(C) ->
-    argparse:parse(Args);
-parse_peer_args(Args = [S | _]) when is_list(S) -> Args.
+parse_peer_args(Args) when is_list(Args) -> % can be string or list of strings
+    case eunit_lib:is_string(Args) of
+        true ->
+            parse_command_line(Args, []);
+        false ->
+            case lists:all(fun eunit_lib:is_string/1, Args) of
+                true ->
+                    Args; % no modification, it is already a list
+                false ->
+                    % error, bad format - not a string or list of strings
+                    erlang:throw({badarg, Args})
+            end
+    end.
 
 %% this returns either a #test{} or #group{} record, or {data, T} to
 %% signal that T has been substituted for the given representation
